@@ -9,3 +9,8 @@
 CHANGELOG.md export-ignore
 README.md export-ignore
 .github/workflows/browser-tests.yml export-ignore
+
+# Frontend asset sources excluded from GitHub's language stats so the repo is
+# reported as PHP (this is a Laravel application; the React/Inertia frontend
+# is a supporting asset layer, not the project's primary language).
+resources/js/** linguist-vendored
