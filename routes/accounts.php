@@ -12,4 +12,8 @@ Route::scopeBindings()->prefix('accounts/{account}')->group(function () {
 
     Route::post('withdraw-optimistic', [AccountController::class, 'withdrawOptimistic'])
         ->name('accounts.withdraw-optimistic');
+
+    Route::post('withdraw-idempotent', [AccountController::class, 'withdrawIdempotent'])
+        ->middleware('idempotent')
+        ->name('accounts.withdraw-idempotent');
 });

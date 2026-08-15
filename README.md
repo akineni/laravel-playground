@@ -7,6 +7,7 @@ A sandbox for practicing backend engineering concepts, **one concept at a time**
 | # | Concept | Status |
 |---|---------|--------|
 | 01 | [Concurrency Control — Optimistic vs Pessimistic Locking](#01--concurrency-control--optimistic-vs-pessimistic-locking) | ✅ Done |
+| 02 | [Idempotency: Safe Retries with an Idempotency Key](#02--idempotency--safe-retries-with-an-idempotency-key) | ✅ Done |
 
 ---
 
@@ -144,3 +145,85 @@ php artisan test --compact tests/Feature/Account/AccountWithdrawalTest.php
 ```
 
 Covers both strategies' happy paths, insufficient-funds rejection, the version-conflict rejection mechanism directly at the repository level, and the `ConflictException → 409` HTTP wiring.
+
+---
+
+## 02 — Idempotency: Safe Retries with an Idempotency Key
+
+### The concept
+
+Locking (Concept 01) protects against two requests running at the *same instant*. It does nothing for the same request running *twice in a row* - which is exactly what happens when a client retries.
+
+> A client calls `POST /withdraw` for ₦4,000. The server debits the account and sends back `200 OK` - but the response never arrives (timeout, dropped connection, a restarting load balancer). From the client's side the request *failed*, so it does the sensible thing and retries the exact same request.
+
+Nothing was raced, no lock was violated - each request was handled correctly and sequentially. The bug is that "processed successfully" and "client received confirmation" are two separate events, and the network sits between them and can fail on its own. The account gets debited twice for one withdrawal the user meant to make once.
+
+**The fix:** the client generates a unique key per logical operation (a UUID) and sends it as an `Idempotency-Key` header. The server remembers the outcome of the first request it sees for that key and, on a repeat, **replays the stored response instead of re-running the operation.**
+
+### How it's implemented here
+
+`App\Http\Middleware\EnsureIdempotencyKey` sits in front of `POST /accounts/{account}/withdraw-idempotent` (alias: `idempotent`) and wraps the whole request in a transaction:
+
+1. **Require the header.** No `Idempotency-Key` → `400`.
+2. **Fingerprint the request** (method + path + body, hashed) so a key can't silently be replayed against a *different* request.
+3. **Claim the key.** Insert a row into `idempotency_keys` (`key` is unique) inside a `DB::transaction()`, then call the controller. Once it returns, save the response status/body onto that same row and commit - key and response become visible together, atomically.
+4. **A duplicate arrives** (the insert hits the unique constraint - either a genuine race or a plain retry after the first one committed): lock that row with `lockForUpdate()` and read it.
+   - Same fingerprint → **replay** the stored response (`Idempotency-Replayed: true` header).
+   - Different fingerprint → **409 Conflict**, key reused for a different request.
+
+The elegant part: `lockForUpdate()` here is the *exact same mechanism* `AccountRepository::findForUpdate()` uses for pessimistic locking in Concept 01 - just applied to a bookkeeping row instead of a balance. A concurrent duplicate doesn't race the original; it **blocks until the original's transaction commits**, then reads the finished result. Two duplicate requests arriving at literally the same millisecond are just as safe as one arriving an hour later.
+
+**A subtlety worth calling out:** because the whole request (including the exception-to-JSON rendering Laravel does internally) happens inside that one transaction, *error* responses get memoized too - not just successes. Retry a request that failed with **422 Insufficient funds** using the same key, and you get that same 422 back, even if you've since topped up the balance. This matches how real idempotency keys behave (Stripe does the same): a key represents one specific logical attempt, errors included. To genuinely try again, use a **new** key.
+
+Relevant code:
+
+- `app/Http/Middleware/EnsureIdempotencyKey.php` - the whole mechanism
+- `app/Models/IdempotencyKey.php` + `database/migrations/*_create_idempotency_keys_table.php`
+- `app/Http/Controllers/v1/Account/AccountController.php` - `withdrawIdempotent()` (reuses `AccountService::withdrawPessimistic()` underneath; idempotency and locking are orthogonal, both apply here)
+- `routes/accounts.php` - the `idempotent` middleware alias registered in `bootstrap/app.php`
+
+### Testing manually in Postman
+
+Same collection as Concept 01 (`php artisan scribe:generate` to regenerate). The endpoint is grouped under **"Idempotency (Retry Safety)"**. It requires the `Idempotency-Key` header - Postman won't add this for you, set it manually per request (any string works; a UUID is conventional).
+
+| Method | Endpoint | Header | Body |
+|---|---|---|---|
+| POST | `/api/v1/accounts/{account}/withdraw-idempotent` | `Idempotency-Key: <uuid>` | `{"amount": 4000}` |
+
+Send it once, note the balance drop. Send the *exact same request* (same key, same body) again - balance doesn't move, and the response carries `Idempotency-Replayed: true`. Change the amount but keep the same key - `409 Conflict`.
+
+### Running the actual scenarios
+
+As with Concept 01, a real demo needs the multi-worker dev server so concurrent requests can genuinely overlap:
+
+```bash
+PHP_CLI_SERVER_WORKERS=4 php artisan serve --no-reload
+```
+
+Then, in another terminal:
+
+```bash
+php artisan accounts:simulate-idempotent-retry --mode=sequential  # lost-response retry
+php artisan accounts:simulate-idempotent-retry --mode=concurrent  # two requests, same key, same instant
+php artisan accounts:simulate-idempotent-retry --mode=conflict    # same key, different payload
+```
+
+Options: `--amount` (default 4000), `--balance` (default 5000), `--base-url` (default `http://127.0.0.1:8000`), optional leading `{account}` argument to reuse an existing account.
+
+**Expected output:**
+
+| Mode | Request A | Request B | Final balance |
+|---|---|---|---|
+| `sequential` | 200 OK | 200 OK `[replayed]` | 1000.00 |
+| `concurrent` | 200 OK (one of the two - whichever wins the insert) | 200 OK `[replayed]` (blocked on the row lock, then replayed) | 1000.00 |
+| `conflict` | 200 OK | 409 Conflict | 1000.00 |
+
+The command prints "Exactly one withdrawal took effect: retries were replayed, not reprocessed." If you ever see a balance that dropped by more than one withdrawal, that's the double-processing bug this concept exists to prevent.
+
+### Automated tests
+
+```bash
+php artisan test --compact tests/Feature/Account/AccountIdempotencyTest.php
+```
+
+Covers the missing-header rejection, a first request completing normally, a retry with the same key replaying instead of double-withdrawing, a reused key with a different payload being rejected with 409, a failed (422) response being memoized and replayed on retry, and a fresh key allowing a genuinely new attempt.
