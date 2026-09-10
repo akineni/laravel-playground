@@ -8,6 +8,7 @@ A sandbox for practicing backend engineering concepts, **one concept at a time**
 |---|---------|--------|
 | 01 | [Concurrency Control — Optimistic vs Pessimistic Locking](#01--concurrency-control--optimistic-vs-pessimistic-locking) | ✅ Done |
 | 02 | [Idempotency: Safe Retries with an Idempotency Key](#02--idempotency--safe-retries-with-an-idempotency-key) | ✅ Done |
+| 03 | [Presigned URLs: Direct-to-Cloud Uploads](#03--presigned-urls-direct-to-cloud-uploads) | ✅ Done |
 
 ---
 
@@ -227,3 +228,88 @@ php artisan test --compact tests/Feature/Account/AccountIdempotencyTest.php
 ```
 
 Covers the missing-header rejection, a first request completing normally, a retry with the same key replaying instead of double-withdrawing, a reused key with a different payload being rejected with 409, a failed (422) response being memoized and replayed on retry, and a fresh key allowing a genuinely new attempt.
+
+---
+
+## 03 — Presigned URLs: Direct-to-Cloud Uploads
+
+### The concept
+
+The naive way to handle a file upload is: client sends the file to your app server, your app server forwards it to storage (S3, Cloudinary, GCS...). Every byte passes through your PHP process twice - once in, once back out - which burns memory, ties up a worker for as long as the upload takes, and routes bandwidth you're paying for through a server that adds nothing to the transfer.
+
+**The fix:** the client uploads directly to the storage provider. Your server's only job is to hand the client a **short-lived, scoped permission slip** - a presigned URL, or (as with Cloudinary) a signature over a fixed set of parameters - so the client can perform *one specific* upload without ever holding your storage credentials.
+
+> AWS S3 calls this a "presigned URL": a URL with a signature baked into its query string, valid for a few minutes, good for exactly one `PUT` to exactly one key. Cloudinary's equivalent is a **signed upload**: instead of signing a URL, you sign a small set of parameters (`timestamp`, `folder`, `public_id`) with your API secret. The client attaches that signature to its own `POST` straight to Cloudinary's upload endpoint. Same idea, different shape - your server never touches the file either way.
+
+### The scenario
+
+An account needs to attach a document (e.g. proof of identity). Instead of `POST`ing the file to this app:
+
+1. Client asks this app: "I want to upload a document for account #1" → **`POST /accounts/{account}/documents/presign`**
+2. This app generates a signature (using `CLOUDINARY_API_SECRET`, which never leaves the server) over a `folder` scoped to that account and a fresh `public_id`, and hands back `{ timestamp, signature, api_key, cloud_name, folder, public_id }`
+3. Client uploads the file **directly to Cloudinary** (`https://api.cloudinary.com/v1_1/{cloud_name}/auto/upload`) with those exact params attached
+4. Cloudinary responds to the client with `{ public_id, version, signature, secure_url }` - note it returns its **own** signature over what it actually stored
+5. Client reports that response back to this app → **`POST /accounts/{account}/documents`**
+6. This app **independently recomputes** Cloudinary's signature over `public_id` + `version` using the same API secret and compares it against what the client sent. Only then does it persist the document.
+
+Step 6 is the part that's easy to skip and dangerous to skip: without it, a client could just `POST` a made-up `secure_url` straight to step 5 and claim to have uploaded anything, without ever touching Cloudinary. Because the signature can only be produced by whoever holds the API secret (this app, or Cloudinary itself), a forged or tampered payload fails verification and is rejected with `422` - the account never ends up with a "document" that doesn't actually exist.
+
+### How it's implemented here
+
+- `app/Services/Cloudinary/CloudinarySignatureService.php` - the actual signing algorithm: sort params alphabetically, join as `key=value` pairs with `&`, append the API secret, `sha1()` the result. Cloudinary computes signatures the exact same way, which is what makes independent verification possible without ever calling Cloudinary's API.
+- `app/Services/Account/AccountDocumentService.php` - `presignUpload()` scopes every signature to `accounts/{account}/documents` plus a fresh UUID `public_id` (so a signature can't be replayed against a different account or an existing file); `store()` re-verifies the response signature before persisting.
+- `app/Exceptions/InvalidUploadSignatureException.php` (422) - thrown when verification fails.
+- `app/Http/Controllers/v1/Account/AccountDocumentController.php` + `routes/accounts.php` - `presign`, `store`, and `index` under `accounts/{account}/documents`.
+- `config/services.php` (`cloudinary` key) - reads `CLOUDINARY_CLOUD_NAME` / `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` from `.env`.
+
+### Setup
+
+Add real Cloudinary credentials to `.env` (get them from your Cloudinary dashboard - the `.env.example` values are placeholders, not real keys):
+
+```
+CLOUDINARY_API_KEY=
+CLOUDINARY_API_SECRET=
+CLOUDINARY_CLOUD_NAME=
+```
+
+Migrate if you haven't already:
+
+```bash
+php artisan migrate
+```
+
+### Testing manually in Postman
+
+Regenerate the collection (`php artisan scribe:generate`) - endpoints are grouped under **"Direct-to-Cloud Uploads: Presigned URLs"**. Since Postman can't upload straight to Cloudinary as part of a collection run, the realistic end-to-end path is the simulate command below; Postman is best used to poke at `presign` and `index` directly, or to replay a `store` payload you already have from a real upload.
+
+| Method | Endpoint | Body |
+|---|---|---|
+| POST | `/api/v1/accounts/{account}/documents/presign` | — |
+| POST | `/api/v1/accounts/{account}/documents` | `{"public_id": "...", "version": ..., "signature": "...", "secure_url": "..."}` |
+| GET | `/api/v1/accounts/{account}/documents` | — |
+
+### Running the actual round trip
+
+Unlike Concepts 01 and 02, this one talks to a real external service, so the simulate command doesn't just hit your local server - it performs a genuine upload to your Cloudinary account:
+
+```bash
+php artisan serve   # single worker is fine here, nothing is racing
+```
+
+Then, in another terminal:
+
+```bash
+php artisan accounts:simulate-presigned-upload
+```
+
+This: requests a signature, uploads a tiny generated PNG directly to Cloudinary with it, reports the genuine result back (**201**, persisted), then reports a forged payload - Cloudinary's real signature reused against a `public_id` it was never actually issued for - which the server rejects (**422**), proving nothing gets persisted without a signature that actually checks out.
+
+**Note:** this command needs outbound internet access to `api.cloudinary.com`. If you're running it inside a network-restricted sandbox, the `presign` step (talking to your own app) still works, but the direct-to-Cloudinary upload will fail to connect - run it from an environment with normal internet access to see the full round trip.
+
+### Automated tests
+
+```bash
+php artisan test --compact tests/Feature/Account/AccountDocumentUploadTest.php
+```
+
+These don't call Cloudinary at all - they fake a known `cloud_name`/`api_key`/`api_secret` in `config()` and compute signatures locally with the same algorithm, so they run offline and don't depend on real credentials. Covers: `presign` producing a signature that matches independent computation, a genuinely-signed payload being persisted, a forged signature being rejected with nothing written to the database, required-field validation on `store`, and `index` listing recorded documents.

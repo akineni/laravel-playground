@@ -6,6 +6,7 @@ use Database\Factories\AccountFactory;
 use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Carbon;
 
 /**
@@ -33,5 +34,13 @@ class Account extends Model
             'balance' => 'decimal:2',
             'version' => 'integer',
         ];
+    }
+
+    /**
+     * @return HasMany<AccountDocument, $this>
+     */
+    public function documents(): HasMany
+    {
+        return $this->hasMany(AccountDocument::class);
     }
 }

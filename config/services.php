@@ -28,6 +28,12 @@ return [
         'region' => env('AWS_DEFAULT_REGION', 'us-east-1'),
     ],
 
+    'cloudinary' => [
+        'cloud_name' => env('CLOUDINARY_CLOUD_NAME'),
+        'api_key' => env('CLOUDINARY_API_KEY'),
+        'api_secret' => env('CLOUDINARY_API_SECRET'),
+    ],
+
     'slack' => [
         'notifications' => [
             'bot_user_oauth_token' => env('SLACK_BOT_USER_OAUTH_TOKEN'),

@@ -2,6 +2,7 @@
 
 use App\Exceptions\ConflictException;
 use App\Exceptions\InsufficientFundsException;
+use App\Exceptions\InvalidUploadSignatureException;
 use App\Helpers\ApiResponse;
 use App\Http\Middleware\EnsureIdempotencyKey;
 use App\Http\Middleware\HandleAppearance;
@@ -42,6 +43,10 @@ return Application::configure(basePath: dirname(__DIR__))
         });
 
         $exceptions->render(function (InsufficientFundsException $e, Request $request) {
+            return ApiResponse::error($e->getMessage(), $e->getCode());
+        });
+
+        $exceptions->render(function (InvalidUploadSignatureException $e, Request $request) {
             return ApiResponse::error($e->getMessage(), $e->getCode());
         });
     })->create();

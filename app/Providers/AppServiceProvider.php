@@ -4,6 +4,7 @@ namespace App\Providers;
 
 use App\Repositories\Contracts\AccountRepositoryInterface;
 use App\Repositories\Eloquent\AccountRepository;
+use App\Services\Cloudinary\CloudinarySignatureService;
 use Carbon\CarbonImmutable;
 use Illuminate\Support\Facades\Date;
 use Illuminate\Support\Facades\DB;
@@ -18,6 +19,12 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->bind(AccountRepositoryInterface::class, AccountRepository::class);
+
+        $this->app->singleton(CloudinarySignatureService::class, fn (): CloudinarySignatureService => new CloudinarySignatureService(
+            cloudName: (string) config('services.cloudinary.cloud_name'),
+            apiKey: (string) config('services.cloudinary.api_key'),
+            apiSecret: (string) config('services.cloudinary.api_secret'),
+        ));
     }
 
     /**
